@@ -1,12 +1,15 @@
 from PyQt6.QtWidgets import (
     QMainWindow, QMenuBar, QMenu, QToolBar, QStatusBar,
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QDockWidget,
-    QFileDialog, QMessageBox, QLabel, QScrollArea,
+    QFileDialog, QMessageBox, QLabel, QScrollArea, QApplication,
 )
-from PyQt6.QtGui import QAction, QActionGroup, QDragEnterEvent, QDropEvent
-from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QAction, QActionGroup, QDragEnterEvent, QDropEvent, QKeyEvent
+from PyQt6.QtCore import Qt, QFileSystemWatcher
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 import pandas as pd
+import os
+import subprocess
+import io
 
 from .state import PlotState
 from .canvas import MplCanvas
@@ -29,6 +32,9 @@ class GraphXApp(QMainWindow):
         self._data_table_window = None
         self._fit_windows = {}     # curve id -> FitWindow
         self._analysis_fit_win = None  # menu-triggered FitWindow
+        self._source_path = None      # track loaded file for watcher & open-in-excel
+        self._file_watcher = QFileSystemWatcher()
+        self._file_watcher.fileChanged.connect(self._on_source_file_changed)
         self._setup_menu_bar()
         self._setup_toolbar()
         self._setup_central_widget()
@@ -48,10 +54,23 @@ class GraphXApp(QMainWindow):
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self._on_open_file)
         file_menu.addAction(open_action)
-        export_action = QAction("&Export...", self)
+        paste_action = QAction("&Paste from Clipboard", self)
+        paste_action.setShortcut("Ctrl+V")
+        paste_action.triggered.connect(self._on_paste)
+        file_menu.addAction(paste_action)
+        file_menu.addSeparator()
+        export_action = QAction("E&xport Plot...", self)
         export_action.setShortcut("Ctrl+E")
         export_action.triggered.connect(self._on_export)
         file_menu.addAction(export_action)
+        export_data_action = QAction("Export &Data...", self)
+        export_data_action.setShortcut("Ctrl+Shift+E")
+        export_data_action.triggered.connect(self._on_export_data)
+        file_menu.addAction(export_data_action)
+        file_menu.addSeparator()
+        excel_action = QAction("Open in E&xcel", self)
+        excel_action.triggered.connect(self._on_open_in_excel)
+        file_menu.addAction(excel_action)
         file_menu.addSeparator()
         exit_action = QAction("E&xit", self)
         exit_action.setShortcut("Ctrl+Q")
@@ -217,6 +236,12 @@ class GraphXApp(QMainWindow):
                     return
         event.ignore()
 
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.modifiers() == Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_V:
+            self._on_paste()
+        else:
+            super().keyPressEvent(event)
+
     def dropEvent(self, event: QDropEvent):
         for url in event.mimeData().urls():
             path = url.toLocalFile()
@@ -236,6 +261,10 @@ class GraphXApp(QMainWindow):
             return
         if df is None or df.empty:
             return
+        self._after_load(df, path)
+
+    def _after_load(self, df, path=None):
+        """Common post-load logic: update state, UI, watcher."""
         self.state.load_dataframe(df)
         self._show_data_table_window()
         self._refresh_columns_ui()
@@ -244,6 +273,112 @@ class GraphXApp(QMainWindow):
         self.status_label.setText(
             f"Loaded {len(df)} rows, {len(df.columns)} cols  |  {len(self.state.curves)} curve(s)"
         )
+        # Set up file watcher if we have a source path
+        if path:
+            self._set_source_path(path)
+
+    def _set_source_path(self, path):
+        """Track the source file to enable watch & open-in-Excel."""
+        if self._source_path:
+            try:
+                self._file_watcher.removePath(self._source_path)
+            except Exception:
+                pass
+        self._source_path = path
+        try:
+            self._file_watcher.addPath(path)
+        except Exception:
+            pass
+
+    def _on_source_file_changed(self, path):
+        """File watcher callback: reload when source file changes on disk."""
+        try:
+            if path.lower().endswith((".xlsx", ".xls")):
+                df = pd.read_excel(path, header=0)
+            else:
+                df = pd.read_csv(path, header=0)
+            self.state.load_dataframe(df)
+            self._refresh_columns_ui()
+            self._sync_state_from_controls()
+            self._redraw()
+            self.status_label.setText(f"Reloaded: {os.path.basename(path)} (file changed on disk)")
+            # Re-add path (file watcher removes on change)
+            self._file_watcher.addPath(path)
+        except Exception as e:
+            self.status_label.setText(f"Auto-reload failed: {e}")
+
+    def _on_paste(self):
+        """Paste tabular data from clipboard (e.g., copied from Excel)."""
+        clipboard = QApplication.clipboard().text()
+        if not clipboard.strip():
+            QMessageBox.warning(self, "Empty Clipboard", "No text data on clipboard.")
+            return
+        try:
+            df = pd.read_csv(io.StringIO(clipboard), sep="\t")
+        except Exception:
+            try:
+                df = pd.read_csv(io.StringIO(clipboard), sep=None, engine="python")
+            except Exception as e:
+                QMessageBox.critical(self, "Paste Error",
+                    f"Could not parse clipboard as tabular data.\n\n{e}")
+                return
+        if df.empty or len(df.columns) < 2:
+            # Try comma-separated
+            try:
+                df = pd.read_csv(io.StringIO(clipboard))
+            except Exception:
+                pass
+        if df is None or df.empty:
+            QMessageBox.warning(self, "Parse Error", "Clipboard data could not be parsed.")
+            return
+        self._after_load(df, path=None)
+        self.status_label.setText(
+            f"Pasted {len(df)} rows, {len(df.columns)} cols from clipboard"
+        )
+
+    def _on_export_data(self):
+        """Export the current dataframe to an Excel or CSV file."""
+        if not self.state.has_data:
+            QMessageBox.warning(self, "No Data", "No data to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Data", "",
+            "Excel Files (*.xlsx);;CSV Files (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            df = self.state.dataframe
+            if path.lower().endswith((".xlsx", ".xls")):
+                df.to_excel(path, index=False)
+            else:
+                df.to_csv(path, index=False)
+            self.status_label.setText(f"Data exported: {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
+
+    def _on_open_in_excel(self):
+        """Open the source file (or export temp file) in Excel."""
+        if self._source_path and os.path.exists(self._source_path):
+            path = self._source_path
+        else:
+            # Export current data to a temp file and open it
+            if not self.state.has_data:
+                QMessageBox.warning(self, "No Data", "Load or paste data first.")
+                return
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+            self.state.dataframe.to_excel(tmp.name, index=False)
+            tmp.close()
+            path = tmp.name
+        try:
+            if os.name == "nt":
+                os.startfile(path)
+            else:
+                subprocess.run(["open", path])
+            self.status_label.setText(f"Opened in Excel: {os.path.basename(path)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not open in Excel: {e}")
 
     # --- Real-time controls changed ---
     def _on_controls_changed(self):
@@ -298,14 +433,8 @@ class GraphXApp(QMainWindow):
         df = dialog.get_dataframe()
         if df is None or df.empty:
             return
-        self.state.load_dataframe(df)
-        self._show_data_table_window()
-        self._refresh_columns_ui()
-        self._sync_state_from_controls()
-        self._redraw()
-        self.status_label.setText(
-            f"Loaded {len(df)} rows, {len(df.columns)} cols  |  {len(self.state.curves)} curve(s)"
-        )
+        path = dialog.path_edit.text()
+        self._after_load(df, path)
 
     def _on_export(self):
         from .dialogs.export import ExportDialog

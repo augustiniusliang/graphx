@@ -1,7 +1,8 @@
-from PyQt6.QtCore import QAbstractTableModel, Qt, pyqtSignal
+from PyQt6.QtCore import QAbstractTableModel, Qt, pyqtSignal, QMimeData
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QTableView, QHeaderView, QApplication,
 )
+from PyQt6.QtGui import QKeyEvent
 
 
 class PandasTableModel(QAbstractTableModel):
@@ -36,6 +37,43 @@ class PandasTableModel(QAbstractTableModel):
         return str(self._df.index[section])
 
 
+class CopyableTableView(QTableView):
+    """QTableView subclass that supports Ctrl+C to copy selected cells."""
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.modifiers() == Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_C:
+            self._copy_selection()
+        else:
+            super().keyPressEvent(event)
+
+    def _copy_selection(self):
+        indexes = self.selectedIndexes()
+        if not indexes:
+            return
+        model = self.model()
+        # Group by row
+        rows = {}
+        for idx in indexes:
+            rows.setdefault(idx.row(), {})[idx.column()] = idx
+        min_col = min(r.keys() for r in rows.values()) if rows else 0
+        max_col = max(r.keys() for r in rows.values()) if rows else 0
+        min_row = min(rows.keys())
+        max_row = max(rows.keys())
+
+        lines = []
+        for r in range(min_row, max_row + 1):
+            line = []
+            for c in range(min_col, max_col + 1):
+                if r in rows and c in rows[r]:
+                    val = model.data(rows[r][c], Qt.ItemDataRole.DisplayRole)
+                    line.append(str(val) if val else "")
+                else:
+                    line.append("")
+            lines.append("\t".join(line))
+
+        QApplication.clipboard().setText("\n".join(lines))
+
+
 class DataTableWidget(QWidget):
     column_clicked = pyqtSignal(str)
 
@@ -44,8 +82,9 @@ class DataTableWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.model = PandasTableModel()
-        self.table = QTableView()
+        self.table = CopyableTableView()
         self.table.setModel(self.model)
+        self.table.setSelectionBehavior(QTableView.SelectionBehavior.SelectItems)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().sectionClicked.connect(self._on_header_clicked)
         layout.addWidget(self.table)
