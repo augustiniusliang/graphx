@@ -2,21 +2,23 @@ from PyQt6.QtWidgets import (
     QMainWindow, QMenuBar, QMenu, QToolBar, QStatusBar,
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QDockWidget,
     QFileDialog, QMessageBox, QLabel, QScrollArea, QApplication,
+    QComboBox, QPushButton,
 )
 from PyQt6.QtGui import QAction, QActionGroup, QDragEnterEvent, QDropEvent, QKeyEvent
-from PyQt6.QtCore import Qt, QFileSystemWatcher
+from PyQt6.QtCore import Qt, QFileSystemWatcher, QTimer
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 import pandas as pd
 import os
 import subprocess
 import io
+import tempfile
 
 from .state import PlotState
 from .canvas import MplCanvas
 from .widgets.plot_controls import PlotControlsWidget, CurvePanelWidget
-from .widgets.data_table import DataTableWindow
 from .widgets.tool_panel import ToolPanelWidget
 from .dialogs.fit_window import FitWindow
+from .excel_sync import ExcelSync
 
 FIT_DASH_COLORS = [
     "#e41a1c", "#377eb8", "#4daf4a", "#984ea3",
@@ -33,8 +35,19 @@ class GraphXApp(QMainWindow):
         self._fit_windows = {}     # curve id -> FitWindow
         self._analysis_fit_win = None  # menu-triggered FitWindow
         self._source_path = None      # track loaded file for watcher & open-in-excel
+        self._temp_excel_path = None  # temp copy opened in Excel
         self._file_watcher = QFileSystemWatcher()
         self._file_watcher.fileChanged.connect(self._on_source_file_changed)
+        self._sheet_combo = None
+        # Directory watcher — detects temp-file changes without opening file handles
+        self._temp_dir_watcher = QFileSystemWatcher()
+        self._temp_dir_watcher.directoryChanged.connect(self._on_temp_dir_changed)
+        self._poll_mtime = 0
+        # Use the system temp directory to avoid OneDrive / cloud-sync locks
+        self._temp_dir = tempfile.gettempdir()
+        self._temp_dir_watcher.addPath(self._temp_dir)
+        self._cleanup_old_temp_files()
+        self.excel_sync = ExcelSync()
         self._setup_menu_bar()
         self._setup_toolbar()
         self._setup_central_widget()
@@ -43,6 +56,46 @@ class GraphXApp(QMainWindow):
         self.setWindowTitle("GraphX")
         self.resize(1200, 800)
         self.setAcceptDrops(True)
+
+    # --- Temp file helpers ---
+    def _cleanup_old_temp_files(self):
+        """Remove leftover temp files from previous sessions."""
+        import glob
+        try:
+            for f in glob.glob(os.path.join(self._temp_dir, "graphx_*")):
+                try:
+                    os.unlink(f)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _arm_polling(self):
+        """Record the current mtime after creating/opening a temp file."""
+        if self._temp_excel_path and os.path.exists(self._temp_excel_path):
+            self._poll_mtime = os.path.getmtime(self._temp_excel_path)
+
+    def _disarm_polling(self):
+        """Forget the current temp file."""
+        self._poll_mtime = 0
+
+    def _on_temp_dir_changed(self, _path):
+        """Directory watcher callback: reload if the temp file's mtime changed."""
+        if not self._temp_excel_path or not os.path.exists(self._temp_excel_path):
+            return
+        try:
+            mtime = os.path.getmtime(self._temp_excel_path)
+            if mtime != self._poll_mtime:
+                self._poll_mtime = mtime
+                self._reload_from_temp()
+        except Exception:
+            pass
+
+    def _sync_temp_file(self, reload_excel=True):
+        """Write all sheets to the temp file. If reload_excel, close & reopen in Excel."""
+        self.excel_sync.sync(self._temp_excel_path, self.state.sheets, reload_excel)
+        if self._temp_excel_path and os.path.exists(self._temp_excel_path):
+            self._poll_mtime = os.path.getmtime(self._temp_excel_path)
 
     # --- Menu bar ---
     def _setup_menu_bar(self):
@@ -71,6 +124,10 @@ class GraphXApp(QMainWindow):
         excel_action = QAction("Open in E&xcel", self)
         excel_action.triggered.connect(self._on_open_in_excel)
         file_menu.addAction(excel_action)
+        sync_action = QAction("&Sync to Excel", self)
+        sync_action.setShortcut("Ctrl+Shift+S")
+        sync_action.triggered.connect(self._on_sync_to_excel)
+        file_menu.addAction(sync_action)
         file_menu.addSeparator()
         exit_action = QAction("E&xit", self)
         exit_action.setShortcut("Ctrl+Q")
@@ -96,12 +153,6 @@ class GraphXApp(QMainWindow):
 
         # View menu
         view_menu = menubar.addMenu("&View")
-        self.toggle_table_action = QAction("&Data Table", self)
-        self.toggle_table_action.setCheckable(True)
-        self.toggle_table_action.setChecked(False)
-        self.toggle_table_action.triggered.connect(self._on_toggle_data_table)
-        view_menu.addAction(self.toggle_table_action)
-
         toggle_curves_action = QAction("&Curve Panel", self)
         toggle_curves_action.setCheckable(True)
         toggle_curves_action.setChecked(True)
@@ -150,6 +201,22 @@ class GraphXApp(QMainWindow):
         sidebar_layout.setContentsMargins(4, 4, 4, 4)
         sidebar_layout.setSpacing(4)
 
+        # Sheet switcher
+        sheet_bar = QWidget()
+        sheet_layout = QHBoxLayout(sheet_bar)
+        sheet_layout.setContentsMargins(0, 0, 0, 0)
+        sheet_layout.setSpacing(3)
+        self._sheet_combo = QComboBox()
+        self._sheet_combo.setMinimumWidth(150)
+        self._sheet_combo.currentTextChanged.connect(self._on_sheet_changed)
+        sheet_layout.addWidget(self._sheet_combo, 1)
+        add_sheet_btn = QPushButton("+")
+        add_sheet_btn.setFixedWidth(28)
+        add_sheet_btn.setToolTip("Add empty sheet")
+        add_sheet_btn.clicked.connect(self._on_add_sheet)
+        sheet_layout.addWidget(add_sheet_btn)
+        sidebar_layout.addWidget(sheet_bar)
+
         self.plot_controls = PlotControlsWidget()
         self.plot_controls.changed.connect(self._on_controls_changed)
         sidebar_layout.addWidget(self.plot_controls)
@@ -193,31 +260,52 @@ class GraphXApp(QMainWindow):
         if self.curve_dock:
             self.curve_dock.setVisible(visible)
 
-    def _on_toggle_data_table(self, visible):
-        if visible:
-            self._show_data_table_window()
-        else:
-            if self._data_table_window:
-                self._data_table_window.hide()
+    def _open_temp_in_excel(self):
+        """Save current dataframe to a temp .xlsx and open it in Excel."""
+        if not self.state.has_data:
+            return
+        try:
+            # Clean up previous temp file
+            if self._temp_excel_path and os.path.exists(self._temp_excel_path):
+                try:
+                    os.unlink(self._temp_excel_path)
+                except Exception:
+                    pass
+            # Write all sheets to a temp file in trusted dir
+            tmp = tempfile.NamedTemporaryFile(
+                suffix=".xlsx", delete=False, prefix="graphx_",
+                dir=self._temp_dir)
+            tmp.close()  # release handle so ExcelWriter can open it
+            with pd.ExcelWriter(tmp.name, engine="openpyxl") as writer:
+                for name, sdf in self.state.sheets.items():
+                    sdf.to_excel(writer, sheet_name=name, index=False)
+            self._temp_excel_path = tmp.name
+            self._arm_polling()
+            if os.name == "nt":
+                os.startfile(self._temp_excel_path)
+            else:
+                subprocess.run(["open", self._temp_excel_path])
+            self.status_label.setText("Data opened in Excel — edit & save to update GraphX")
+        except Exception as e:
+            QMessageBox.warning(self, "Excel Error", f"Could not open Excel: {e}")
 
-    def _show_data_table_window(self):
-        if self._data_table_window is None:
-            self._data_table_window = DataTableWindow()
-            self._data_table_window.column_clicked.connect(self._on_column_clicked)
-        self._data_table_window.show()
-        self._data_table_window.raise_()
-        self.toggle_table_action.setChecked(True)
-
-    def _on_column_clicked(self, col_name):
-        """Insert clicked column name into the calculator expression field."""
-        calc_edit = self.tool_panel.calc_expr_edit
-        cursor = calc_edit.cursorPosition()
-        current = calc_edit.text()
-        new_text = current[:cursor] + col_name + current[cursor:]
-        calc_edit.setText(new_text)
-        calc_edit.setFocus()
-        calc_edit.setCursorPosition(cursor + len(col_name))
-        self.status_label.setText(f"Inserted column: {col_name}")
+    def _open_existing_in_excel(self, path):
+        """Open an existing temp file in Excel (used for dragged/dropped files)."""
+        try:
+            if self._temp_excel_path and os.path.exists(self._temp_excel_path):
+                try:
+                    os.unlink(self._temp_excel_path)
+                except Exception:
+                    pass
+            self._temp_excel_path = path
+            self._arm_polling()
+            if os.name == "nt":
+                os.startfile(path)
+            else:
+                subprocess.run(["open", path])
+            self.status_label.setText("Data opened in Excel — edit & save to update GraphX")
+        except Exception as e:
+            QMessageBox.warning(self, "Excel Error", f"Could not open Excel: {e}")
 
     # --- Status bar ---
     def _setup_status_bar(self):
@@ -250,32 +338,64 @@ class GraphXApp(QMainWindow):
                 break
 
     def _load_file_direct(self, path):
-        """Load a CSV or Excel file directly (bypasses the import dialog)."""
+        """Copy the dropped file to a temp folder, then load the editable copy."""
+        import shutil
+        ext = os.path.splitext(path)[1]
+        try:
+            tmp = tempfile.NamedTemporaryFile(
+                suffix=ext, delete=False, prefix="graphx_",
+                dir=self._temp_dir)
+            tmp.close()
+            shutil.copy2(path, tmp.name)
+        except Exception as e:
+            QMessageBox.critical(self, "Import Error", f"Could not copy file: {e}")
+            return
         try:
             if path.lower().endswith((".xlsx", ".xls")):
-                df = pd.read_excel(path, header=0)
+                with pd.ExcelFile(tmp.name) as xls:
+                    sheets = {}
+                    for name in xls.sheet_names:
+                        sheets[name] = pd.read_excel(tmp.name, sheet_name=name, header=0)
+                self.state.load_sheets(sheets)
             else:
-                df = pd.read_csv(path, header=0)
+                df = pd.read_csv(tmp.name, header=0)
+                if df is None or df.empty:
+                    return
+                self.state.load_dataframe(df)
+            self._after_load(None, tmp.name)
         except Exception as e:
             QMessageBox.critical(self, "Import Error", str(e))
             return
-        if df is None or df.empty:
-            return
-        self._after_load(df, path)
 
     def _after_load(self, df, path=None):
-        """Common post-load logic: update state, UI, watcher."""
-        self.state.load_dataframe(df)
-        self._show_data_table_window()
-        self._refresh_columns_ui()
-        self._sync_state_from_controls()
-        self._redraw()
-        self.status_label.setText(
-            f"Loaded {len(df)} rows, {len(df.columns)} cols  |  {len(self.state.curves)} curve(s)"
-        )
-        # Set up file watcher if we have a source path
-        if path:
-            self._set_source_path(path)
+        """Common post-load logic: update state, UI, watcher, open in Excel.
+        *df* may be a DataFrame or a dict of {sheet_name: DataFrame}."""
+        try:
+            if df is not None:
+                if isinstance(df, dict):
+                    self.state.load_sheets(df)
+                else:
+                    self.state.load_dataframe(df)
+            if not self.state.sheets:
+                return
+            self._rebuild_sheet_combo()
+            self._refresh_columns_ui()
+            self._sync_state_from_controls()
+            self._redraw()
+            dff = self.state.dataframe
+            ns = len(self.state.sheets)
+            if dff is not None:
+                self.status_label.setText(
+                    f"{ns} sheet(s) | {len(dff)} rows, {len(dff.columns)} cols  |  {len(self.state.curves)} curve(s)"
+                )
+            if path and "graphx_" in os.path.basename(path):
+                self._open_existing_in_excel(path)
+            else:
+                self._open_temp_in_excel()
+                if path:
+                    self._set_source_path(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Load Error", str(e))
 
     def _set_source_path(self, path):
         """Track the source file to enable watch & open-in-Excel."""
@@ -290,22 +410,106 @@ class GraphXApp(QMainWindow):
         except Exception:
             pass
 
-    def _on_source_file_changed(self, path):
-        """File watcher callback: reload when source file changes on disk."""
-        try:
-            if path.lower().endswith((".xlsx", ".xls")):
-                df = pd.read_excel(path, header=0)
-            else:
-                df = pd.read_csv(path, header=0)
-            self.state.load_dataframe(df)
+    def _rebuild_sheet_combo(self):
+        """Refresh the sheet combo to match state."""
+        if self._sheet_combo is None:
+            return
+        self._sheet_combo.blockSignals(True)
+        self._sheet_combo.clear()
+        self._sheet_combo.addItems(self.state.sheet_names)
+        if self.state.active_sheet:
+            self._sheet_combo.setCurrentText(self.state.active_sheet)
+        self._sheet_combo.blockSignals(False)
+
+    def _on_sheet_changed(self, name):
+        if name and name != self.state.active_sheet:
+            self.state.set_active_sheet(name)
             self._refresh_columns_ui()
             self._sync_state_from_controls()
             self._redraw()
-            self.status_label.setText(f"Reloaded: {os.path.basename(path)} (file changed on disk)")
-            # Re-add path (file watcher removes on change)
-            self._file_watcher.addPath(path)
+            self._rebuild_sheet_combo()
+
+    def _on_add_sheet(self):
+        import pandas as pd
+        name = f"Sheet{len(self.state.sheets) + 1}"
+        while name in self.state.sheets:
+            name = f"Sheet{int(name.replace('Sheet', '')) + 1}"
+        self.state.add_sheet(name, pd.DataFrame())
+        self._rebuild_sheet_combo()
+        self._sheet_combo.setCurrentText(name)
+        self._sync_temp_file(reload_excel=True)
+
+    def _on_source_file_changed(self, path):
+        """File watcher callback: Excel uses safe-save (delete+rename), so we
+        delay 500ms to let the new file land before reading."""
+        QTimer.singleShot(500, lambda p=path: self._do_reload_file(p))
+
+    def _do_reload_file(self, path):
+        try:
+            if path == self._temp_excel_path:
+                self._reload_from_temp()
+            else:
+                if path.lower().endswith((".xlsx", ".xls")):
+                    with pd.ExcelFile(path) as xls:
+                        sheets = {n: pd.read_excel(path, sheet_name=n, header=0)
+                                  for n in xls.sheet_names}
+                    self.state.load_sheets(sheets)
+                else:
+                    df = pd.read_csv(path, header=0)
+                    self.state.load_dataframe(df)
+                self._rebuild_sheet_combo()
+                self._refresh_columns_ui()
+                self._sync_state_from_controls()
+                self._redraw()
+                dff = self.state.dataframe
+                if dff is not None:
+                    self.status_label.setText(
+                        f"Reloaded: {os.path.basename(path)} ({len(dff)}r x {len(dff.columns)}c)"
+                    )
+                self._file_watcher.addPath(path)
         except Exception as e:
             self.status_label.setText(f"Auto-reload failed: {e}")
+
+    def _reload_from_temp(self):
+        """Reload data from the temp Excel file (edited by user in Excel)."""
+        path = self._temp_excel_path
+        if not path or not os.path.exists(path):
+            return
+        try:
+            if path.lower().endswith((".xlsx", ".xls")):
+                with pd.ExcelFile(path) as xls:
+                    for name in xls.sheet_names:
+                        df = pd.read_excel(path, sheet_name=name, header=0)
+                        df = self.state._normalize_columns(df)
+                        if name in self.state.sheets:
+                            self.state.sheets[name] = df
+                        else:
+                            self.state.add_sheet(name, df)
+            else:
+                df = pd.read_csv(path, header=0)
+                self.state.dataframe = df
+
+            # Clean up curves referencing columns that no longer exist
+            valid_cols = set(self.state.columns)
+            self.state.curves = [c for c in self.state.curves
+                                 if c.x_col in valid_cols and c.y_col in valid_cols]
+            if not self.state.curves and self.state.columns:
+                self.state.add_curve()
+
+            self._rebuild_sheet_combo()
+            self._refresh_columns_ui()
+            self._sync_state_from_controls()
+            self._redraw()
+
+            dff = self.state.dataframe
+            if dff is not None:
+                self.status_label.setText(
+                    f"Reloaded from Excel ({len(dff)}r x {len(dff.columns)}c)"
+                )
+            self._poll_mtime = os.path.getmtime(path)
+        except Exception as e:
+            self.status_label.setText(f"Reload failed: {e}")
+            self._poll_mtime = 0  # force retry on next poll
 
     def _on_paste(self):
         """Paste tabular data from clipboard (e.g., copied from Excel)."""
@@ -358,19 +562,14 @@ class GraphXApp(QMainWindow):
             QMessageBox.critical(self, "Export Error", str(e))
 
     def _on_open_in_excel(self):
-        """Open the source file (or export temp file) in Excel."""
+        """Open the data in Excel (source file or temp copy)."""
         if self._source_path and os.path.exists(self._source_path):
             path = self._source_path
+        elif self._temp_excel_path and os.path.exists(self._temp_excel_path):
+            path = self._temp_excel_path
         else:
-            # Export current data to a temp file and open it
-            if not self.state.has_data:
-                QMessageBox.warning(self, "No Data", "Load or paste data first.")
-                return
-            import tempfile
-            tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
-            self.state.dataframe.to_excel(tmp.name, index=False)
-            tmp.close()
-            path = tmp.name
+            QMessageBox.warning(self, "No Data", "Load or paste data first.")
+            return
         try:
             if os.name == "nt":
                 os.startfile(path)
@@ -379,6 +578,24 @@ class GraphXApp(QMainWindow):
             self.status_label.setText(f"Opened in Excel: {os.path.basename(path)}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Could not open in Excel: {e}")
+
+    def _on_sync_to_excel(self):
+        """Write current sheets to the temp file and reload in Excel via COM."""
+        if not self._temp_excel_path:
+            QMessageBox.warning(self, "No Excel", "Open data in Excel first (File → Open in Excel).")
+            return
+        if not self.state.has_data:
+            return
+        try:
+            self._sync_temp_file(reload_excel=True)
+            self.status_label.setText("Synced to Excel")
+        except PermissionError:
+            QMessageBox.warning(
+                self, "File Locked",
+                "Could not release the file lock. Close the file in Excel and try again."
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Sync Error", str(e))
 
     # --- Real-time controls changed ---
     def _on_controls_changed(self):
@@ -420,9 +637,10 @@ class GraphXApp(QMainWindow):
         """Refresh column-dependent UI after dataframe changes."""
         self.curve_panel.load_columns(self.state.columns)
         self._rebuild_curve_rows()
-        if self._data_table_window:
-            self._data_table_window.load_dataframe(self.state.dataframe)
-        self.tool_panel.set_summary_targets(self.state.columns, len(self.state.dataframe))
+        nrows = len(self.state.dataframe) if self.state.dataframe is not None else 0
+        self.tool_panel.set_summary_targets(self.state.columns, nrows)
+        if self.state.has_data:
+            self.tool_panel.set_calc_completions(self.state.sheets, self.state.active_sheet)
 
     # --- Slots ---
     def _on_open_file(self):
@@ -430,11 +648,15 @@ class GraphXApp(QMainWindow):
         dialog = ImportDataDialog(self)
         if dialog.exec() != ImportDataDialog.DialogCode.Accepted:
             return
-        df = dialog.get_dataframe()
-        if df is None or df.empty:
-            return
         path = dialog.path_edit.text()
-        self._after_load(df, path)
+        sheets = dialog.get_sheets()
+        if sheets:
+            self._after_load(sheets, path)
+        else:
+            df = dialog.get_dataframe()
+            if df is None or df.empty:
+                return
+            self._after_load(df, path)
 
     def _on_export(self):
         from .dialogs.export import ExportDialog
@@ -459,6 +681,9 @@ class GraphXApp(QMainWindow):
         else:
             win = FitWindow(curve=curve, all_curves=self.state.curves, parent=self)
             win.fit_requested.connect(lambda cfg: self._on_fit_window_request(win, cfg))
+            win.extrapolation_requested.connect(lambda cfg: self._on_extrapolation_requested(win, cfg))
+            win.save_fit_params_requested.connect(lambda: self._on_save_fit_params(win))
+            win.save_predictions_requested.connect(lambda: self._on_save_predictions(win))
             self._fit_windows[curve_id] = win
         win.show()
         win.raise_()
@@ -478,9 +703,19 @@ class GraphXApp(QMainWindow):
             self._analysis_fit_win.fit_requested.connect(
                 lambda cfg: self._on_analysis_fit_requested(self._analysis_fit_win, cfg)
             )
+            self._analysis_fit_win.extrapolation_requested.connect(
+                lambda cfg: self._on_extrapolation_requested(self._analysis_fit_win, cfg)
+            )
+            self._analysis_fit_win.save_fit_params_requested.connect(
+                lambda: self._on_save_fit_params(self._analysis_fit_win)
+            )
+            self._analysis_fit_win.save_predictions_requested.connect(
+                lambda: self._on_save_predictions(self._analysis_fit_win)
+            )
         else:
             # Refresh curves in existing window
             self._analysis_fit_win._all_curves = self.state.curves
+            self._analysis_fit_win.curve = self.state.first_curve
         self._analysis_fit_win.show()
         self._analysis_fit_win.raise_()
 
@@ -522,6 +757,79 @@ class GraphXApp(QMainWindow):
         self._redraw()
         win.show_results(self._format_fit_result(result))
         self.status_label.setText(f"Fit applied: {cfg.get('curve_label', 'row')} ({fit_type})")
+
+    def _on_extrapolation_requested(self, win, cfg):
+        """Predict y for given x values using current fit results."""
+        if not self.state.analysis_results:
+            QMessageBox.warning(self, "No Fit", "Run a fit first before extrapolating.")
+            return
+        from .analysis.fitting import extrapolate
+        x_values = cfg["x_values"]
+        all_points = []
+        for ar in self.state.analysis_results:
+            if ar.get("fitted_fn"):
+                try:
+                    pts = extrapolate(ar, x_values)
+                    for p in pts:
+                        p["label"] = ar.get("curve_label", "")
+                        p["color"] = ar.get("curve_color", "#e41a1c")
+                    all_points.extend(pts)
+                except Exception:
+                    pass
+        self.state.extrapolation_points = all_points
+        self._redraw()
+        win.show_extrapolation(all_points)
+
+    def _on_save_fit_params(self, win):
+        """Save fit parameters (slope, intercept, R², etc.) to a 'Fit Results' sheet."""
+        results = self.state.analysis_results
+        if not results:
+            QMessageBox.warning(self, "No Fit", "Run a fit first.")
+            return
+        rows = []
+        for ar in results:
+            if ar.get("type") not in ("linear", "polynomial", "exponential"):
+                continue
+            row = {
+                "curve": ar.get("curve_label", ""),
+                "type": ar.get("type", ""),
+            }
+            for key in ("slope", "intercept", "r_value", "p_value",
+                        "r_squared", "a", "b", "degree"):
+                if key in ar:
+                    row[key] = ar[key]
+            rows.append(row)
+        if not rows:
+            return
+        pdf = pd.DataFrame(rows)
+        sheet_name = "Fit Results"
+        if sheet_name in self.state.sheets:
+            existing = self.state.sheets[sheet_name]
+            pdf = pd.concat([existing, pdf], ignore_index=True)
+            self.state.sheets[sheet_name] = pdf
+        else:
+            self.state.add_sheet(sheet_name, pdf)
+        self._rebuild_sheet_combo()
+        self.status_label.setText(f"Fit params saved to sheet '{sheet_name}'")
+        self._sync_temp_file(reload_excel=True)
+
+    def _on_save_predictions(self, win):
+        """Save extrapolation predictions to a new sheet."""
+        pts = self.state.extrapolation_points
+        if not pts:
+            QMessageBox.warning(self, "No Predictions", "Run extrapolation first.")
+            return
+        pdf = pd.DataFrame([{"x_pred": p["x"], "y_pred": p["y"]} for p in pts])
+        base = "Predictions"
+        name = base
+        i = 1
+        while name in self.state.sheets:
+            i += 1
+            name = f"{base}_{i}"
+        self.state.add_sheet(name, pdf)
+        self._rebuild_sheet_combo()
+        self.status_label.setText(f"Predictions saved to sheet '{name}'")
+        self._sync_temp_file(reload_excel=True)
 
     def _on_analysis_fit_requested(self, win, cfg):
         """Handle fit from the standalone analysis FitWindow (may fit multiple curves)."""
@@ -652,12 +960,13 @@ class GraphXApp(QMainWindow):
         if not self.state.has_data:
             QMessageBox.warning(self, "No Data", "Load data first.")
             return
-        from .analysis.calculator import evaluate, evaluate_rowwise
+        from .analysis.calculator import evaluate_cross_sheet, evaluate_rowwise
         try:
             if direction == "row":
                 series = evaluate_rowwise(self.state.dataframe, expression)
             else:
-                series = evaluate(self.state.dataframe, expression)
+                series = evaluate_cross_sheet(
+                    self.state.sheets, self.state.active_sheet, expression)
         except Exception as e:
             QMessageBox.critical(self, "Calculator Error", str(e))
             return
@@ -669,6 +978,11 @@ class GraphXApp(QMainWindow):
         )
         self._redraw()
         self.status_label.setText(f"Calculated [{direction}]: {expression} -> {self.state.columns[-1]}")
+        # Auto-sync the new column to Excel so the user sees it immediately
+        try:
+            self._sync_temp_file(reload_excel=True)
+        except Exception:
+            pass
 
     def _on_summarize(self, direction, target):
         if not self.state.has_data:
@@ -748,6 +1062,9 @@ class GraphXApp(QMainWindow):
     def _redraw(self):
         if not self.state.has_data or not self.state.curves:
             self.canvas.clear()
+            if (hasattr(self.canvas.figure, '_suptitle')
+                    and self.canvas.figure._suptitle is not None):
+                self.canvas.figure._suptitle.set_text("")
             self.canvas.draw_idle()
             return
 
@@ -786,30 +1103,32 @@ class GraphXApp(QMainWindow):
                 if ptype not in ("pie", "histogram", "surface_3d"):
                     kwargs["label"] = label
                 plot_fn(target, df, curve.x_col, curve.y_col, **kwargs)
+
+            # Titles and labels
+            if self.state.title:
+                self.canvas.figure.suptitle(self.state.title, fontsize=13, fontweight="bold")
+            elif (hasattr(self.canvas.figure, '_suptitle')
+                  and self.canvas.figure._suptitle is not None):
+                self.canvas.figure._suptitle.set_text("")
+            if self.state.subtitle:
+                target.set_title(self.state.subtitle, fontsize=10, loc="center", pad=12)
+            if self.state.x_label:
+                target.set_xlabel(self.state.x_label)
+            if self.state.y_label:
+                target.set_ylabel(self.state.y_label)
+            if self.state.show_legend and ptype not in ("pie", "histogram", "surface_3d"):
+                target.legend()
+
+            self._draw_analysis_overlay(target, ptype)
+            self._draw_error_bars(target)
+
+            self.canvas.draw_idle()
+            n_eb = len(self.state.error_bar_points) if self.state.show_error_bars else 0
+            self.status_label.setText(
+                f"Plot: {ptype}  |  {len(visible_curves)} curve(s)  |  {n_eb} error bar(s)"
+            )
         except Exception as e:
             self.status_label.setText(f"Plot error: {e}")
-            return
-
-        # Titles and labels
-        if self.state.title:
-            self.canvas.figure.suptitle(self.state.title, fontsize=13, fontweight="bold")
-        if self.state.subtitle:
-            target.set_title(self.state.subtitle, fontsize=10, loc="center", pad=12)
-        if self.state.x_label:
-            target.set_xlabel(self.state.x_label)
-        if self.state.y_label:
-            target.set_ylabel(self.state.y_label)
-        if self.state.show_legend and ptype not in ("pie", "histogram", "surface_3d"):
-            target.legend()
-
-        self._draw_analysis_overlay(target, ptype)
-        self._draw_error_bars(target)
-
-        self.canvas.draw_idle()
-        n_eb = len(self.state.error_bar_points) if self.state.show_error_bars else 0
-        self.status_label.setText(
-            f"Plot: {ptype}  |  {len(visible_curves)} curve(s)  |  {n_eb} error bar(s)"
-        )
 
     def _draw_analysis_overlay(self, axes, plot_type):
         results = self.state.analysis_results
@@ -869,6 +1188,18 @@ class GraphXApp(QMainWindow):
                                label=f'Optimal k = {ar["optimal_k"]}')
             if self.state.show_legend:
                 axes.legend()
+
+        # Extrapolation points
+        for ep in self.state.extrapolation_points:
+            axes.scatter(
+                ep["x"], ep["y"], marker="D", s=100,
+                color=ep.get("color", "#e41a1c"),
+                edgecolors="black", linewidths=1.5,
+                zorder=10,
+                label=f"pred ({ep.get('label', '')}): x={ep['x']:.3f}, y={ep['y']:.3f}",
+            )
+        if self.state.extrapolation_points and self.state.show_legend:
+            axes.legend()
 
     def _draw_error_bars(self, axes):
         if not self.state.show_error_bars:

@@ -1,6 +1,7 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox,
-    QSpinBox, QPushButton, QTextEdit, QGroupBox,
+    QSpinBox, QPushButton, QTextEdit, QGroupBox, QLineEdit,
+    QMessageBox,
 )
 from PyQt6.QtCore import pyqtSignal
 
@@ -11,6 +12,9 @@ class FitWindow(QWidget):
     Supports both column-wise and row-wise fitting with direction toggle.
     """
     fit_requested = pyqtSignal(dict)  # {fit_type, degree, direction, x_col, y_col, row_index, curve_label, curve_color}
+    extrapolation_requested = pyqtSignal(dict)  # {x_values: [float, ...]}
+    save_fit_params_requested = pyqtSignal()  # save current fit params to sheet
+    save_predictions_requested = pyqtSignal()  # save extrapolation predictions to sheet
 
     def __init__(self, curve=None, all_curves=None, parent=None):
         super().__init__(parent, parent.windowFlags() if parent else 0)
@@ -95,6 +99,39 @@ class FitWindow(QWidget):
         self.results_view.setReadOnly(True)
         layout.addWidget(self.results_view)
 
+        # Extrapolation
+        extrap_group = QGroupBox("Extrapolate")
+        extrap_layout = QVBoxLayout(extrap_group)
+        x_row = QHBoxLayout()
+        x_row.addWidget(QLabel("x:"))
+        self.extrap_input = QLineEdit()
+        self.extrap_input.setPlaceholderText("e.g. 1.5, 2.0, 3.0")
+        self.extrap_input.returnPressed.connect(self._on_extrapolate)
+        x_row.addWidget(self.extrap_input)
+        extrap_layout.addLayout(x_row)
+        self.extrap_btn = QPushButton("Predict")
+        self.extrap_btn.clicked.connect(self._on_extrapolate)
+        extrap_layout.addWidget(self.extrap_btn)
+        self.extrap_result = QLabel("")
+        self.extrap_result.setStyleSheet("font-family: monospace;")
+        extrap_layout.addWidget(self.extrap_result)
+        layout.addWidget(extrap_group)
+
+        # Save to sheet
+        save_group = QGroupBox("Save to Sheet")
+        save_layout = QVBoxLayout(save_group)
+        btn_row = QHBoxLayout()
+        self.save_params_btn = QPushButton("Save Fit Params")
+        self.save_params_btn.setToolTip("Save slope, intercept, R², etc. as a new sheet")
+        self.save_params_btn.clicked.connect(self.save_fit_params_requested.emit)
+        btn_row.addWidget(self.save_params_btn)
+        self.save_pred_btn = QPushButton("Save Predictions")
+        self.save_pred_btn.setToolTip("Save extrapolated x, y values as columns")
+        self.save_pred_btn.clicked.connect(self.save_predictions_requested.emit)
+        btn_row.addWidget(self.save_pred_btn)
+        save_layout.addLayout(btn_row)
+        layout.addWidget(save_group)
+
     def _get_selected_curves(self):
         """Return list of curves to fit based on selection."""
         if len(self._all_curves) <= 1:
@@ -138,3 +175,20 @@ class FitWindow(QWidget):
             self.results_view.setText(current + "\n" + text)
         else:
             self.results_view.setText(text)
+
+    def _on_extrapolate(self):
+        raw = self.extrap_input.text().strip()
+        if not raw:
+            return
+        try:
+            x_values = [float(v.strip()) for v in raw.split(",") if v.strip()]
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Input", "Enter comma-separated numbers, e.g. 1.5, 2.0, 3.0")
+            return
+        if not x_values:
+            return
+        self.extrapolation_requested.emit({"x_values": x_values})
+
+    def show_extrapolation(self, points):
+        lines = [f"x={p['x']:.4f} -> y={p['y']:.4f}" for p in points]
+        self.extrap_result.setText("\n".join(lines))

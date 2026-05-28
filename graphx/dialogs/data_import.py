@@ -12,6 +12,7 @@ class ImportDataDialog(QDialog):
         self.setWindowTitle("Import Data")
         self.resize(700, 500)
         self._df = None
+        self._sheets = None
 
         layout = QVBoxLayout(self)
 
@@ -30,6 +31,7 @@ class ImportDataDialog(QDialog):
         opts_layout.addWidget(QLabel("Sheet:"))
         self.sheet_combo = QComboBox()
         self.sheet_combo.setEnabled(False)
+        self.sheet_combo.currentTextChanged.connect(self._on_sheet_changed)
         opts_layout.addWidget(self.sheet_combo)
         opts_layout.addWidget(QLabel("Header row:"))
         self.header_spin = QSpinBox()
@@ -62,17 +64,29 @@ class ImportDataDialog(QDialog):
     def _preview(self, path):
         try:
             if path.lower().endswith((".xlsx", ".xls")):
-                xl = pd.ExcelFile(path)
+                with pd.ExcelFile(path) as xl:
+                    self._sheets = {
+                        name: pd.read_excel(path, sheet_name=name, header=self.header_spin.value())
+                        for name in xl.sheet_names
+                    }
+                self.sheet_combo.blockSignals(True)
                 self.sheet_combo.clear()
-                self.sheet_combo.addItems(xl.sheet_names)
+                self.sheet_combo.addItems(list(self._sheets.keys()))
                 self.sheet_combo.setEnabled(True)
-                self._df = pd.read_excel(path, sheet_name=xl.sheet_names[0], header=self.header_spin.value())
+                self.sheet_combo.blockSignals(False)
+                self._df = self._sheets[self.sheet_combo.currentText()]
             else:
                 self.sheet_combo.setEnabled(False)
                 self._df = pd.read_csv(path, header=self.header_spin.value())
+                self._sheets = None
             self._show_preview(self._df.head(100))
         except Exception as e:
             QMessageBox.critical(self, "Import Error", str(e))
+
+    def _on_sheet_changed(self, name):
+        if self._sheets and name in self._sheets:
+            self._df = self._sheets[name]
+            self._show_preview(self._df.head(100))
 
     def _show_preview(self, df):
         self.preview_table.setRowCount(len(df))
@@ -93,3 +107,7 @@ class ImportDataDialog(QDialog):
 
     def get_dataframe(self):
         return self._df
+
+    def get_sheets(self):
+        """Return all sheets as a dict (name -> DataFrame), or None for CSV."""
+        return self._sheets

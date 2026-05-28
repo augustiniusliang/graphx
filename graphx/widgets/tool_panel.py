@@ -1,8 +1,36 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QLabel, QComboBox,
-    QSpinBox, QPushButton, QTextEdit, QLineEdit, QMessageBox,
+    QSpinBox, QPushButton, QTextEdit, QPlainTextEdit, QLineEdit, QMessageBox, QCompleter,
 )
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import pyqtSignal, Qt, QStringListModel
+from PyQt6.QtGui import QTextCursor, QKeyEvent
+from .expression_highlighter import ExpressionHighlighter
+import re
+
+
+class ExprEdit(QPlainTextEdit):
+    """Single-line QPlainTextEdit whose keyPressEvent blocks Enter/Return
+    so a new paragraph is never inserted (which would destroy content when
+    ``setMaximumBlockCount(1)`` is active)."""
+    enter_pressed = pyqtSignal()
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.enter_pressed.emit()
+            return
+        super().keyPressEvent(event)
+
+
+class ExpressionCompleter(QCompleter):
+    """QCompleter that splits on expression operators so completion
+    is based on the current token, not the whole expression text."""
+
+    _TOKEN_RE = re.compile(r'[\w.]+$')
+
+    def splitPath(self, path):
+        m = self._TOKEN_RE.search(path)
+        token = m.group() if m else ""
+        return [token]
 
 
 class ToolPanelWidget(QWidget):
@@ -71,9 +99,42 @@ class ToolPanelWidget(QWidget):
         calc_layout.addWidget(self.calc_direction_combo)
 
         calc_layout.addWidget(QLabel("Expression:"))
-        self.calc_expr_edit = QLineEdit()
-        self.calc_expr_edit.setPlaceholderText("e.g. col_A + col_B, log(col_A), col_A ** 2")
+        self.calc_expr_edit = ExprEdit()
+        self.calc_expr_edit.setPlaceholderText(
+            "e.g. col_A + col_B, Sheet.col_C * col_D, log(col_A)")
+        self.calc_expr_edit.setMaximumBlockCount(1)
+        self.calc_expr_edit.setTabChangesFocus(True)
+        self.calc_expr_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.calc_expr_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.calc_expr_edit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.calc_expr_edit.setFixedHeight(32)
+        self.calc_expr_edit.enter_pressed.connect(self._on_enter_pressed)
+        self._highlighter = ExpressionHighlighter(self.calc_expr_edit.document())
         calc_layout.addWidget(self.calc_expr_edit)
+
+        # IDE-style autocomplete — popup follows cursor, replaces only current token
+        self._completer_model = QStringListModel()
+        self._completer = ExpressionCompleter(self._completer_model, self)
+        self._completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self._completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self._completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        # Connect popup's activated (gives model index) instead of completer's
+        # (which may emit with empty/wrong text when used with QPlainTextEdit).
+        self._completer.popup().activated.connect(self._on_popup_activated)
+        # setWidget (not setCompleter) → no QLineEdit built-in replacement logic
+        self._completer.setWidget(self.calc_expr_edit)
+        self._completing = False
+        self.calc_expr_edit.textChanged.connect(self._on_expr_text_changed)
+        self.calc_expr_edit.cursorPositionChanged.connect(
+            self._on_cursor_position_changed)
+        self.calc_expr_edit.installEventFilter(self)
+
+        # Cross-sheet hint
+        self.cross_sheet_hint = QLabel(
+            "Type to autocomplete | Ctrl+Space to browse all columns"
+        )
+        self.cross_sheet_hint.setStyleSheet("color: #888; font-size: 11px;")
+        calc_layout.addWidget(self.cross_sheet_hint)
 
         # Row hint
         self.calc_row_hint = QLabel("Row mode: use 'r' for the row vector, e.g. np.mean(r)")
@@ -117,6 +178,9 @@ class ToolPanelWidget(QWidget):
         calc_layout.addWidget(self.calc_results)
         calc_layout.addStretch()
         tabs.addTab(calc_tab, "Calculator")
+
+        self._summary_columns = []
+        self._summary_row_count = 0
 
         # ---- Summarize tab (error bars) ----
         summary_tab = QWidget()
@@ -180,17 +244,235 @@ class ToolPanelWidget(QWidget):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.addWidget(tabs)
 
+    _BRACKET_PAIRS = {"(": ")", "[": "]", "{": "}"}
+
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+        if obj is self.calc_expr_edit and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            ctrl = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+
+            # Ctrl+Space — force-show completions
+            if key == Qt.Key.Key_Space and ctrl:
+                self._completer.setCompletionPrefix("")
+                self._completer.complete()
+                self._reposition_popup()
+                return True
+
+            # Popup navigation keys — delegate to completer
+            popup = self._completer.popup()
+            if popup and popup.isVisible():
+                if key == Qt.Key.Key_Escape:
+                    popup.hide()
+                    return True
+                if key in (Qt.Key.Key_Up, Qt.Key.Key_Down,
+                           Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
+                    self._navigate_popup(key, popup)
+                    return True
+
+            # Opening brackets — auto-insert closing pair
+            if key == Qt.Key.Key_ParenLeft:
+                return self._handle_bracket_open("(")
+            if key == Qt.Key.Key_BracketLeft:
+                return self._handle_bracket_open("[")
+            if key == Qt.Key.Key_BraceLeft:
+                return self._handle_bracket_open("{")
+
+            # Closing brackets — smart skip if already present
+            if key == Qt.Key.Key_ParenRight:
+                return self._handle_bracket_close(")")
+            if key == Qt.Key.Key_BracketRight:
+                return self._handle_bracket_close("]")
+            if key == Qt.Key.Key_BraceRight:
+                return self._handle_bracket_close("}")
+
+            # Backspace between empty pair — delete both
+            if key == Qt.Key.Key_Backspace:
+                if self._handle_bracket_backspace():
+                    return True
+
+        return super().eventFilter(obj, event)
+
+    # ------------------------------------------------------------------
+    # Bracket helpers
+    # ------------------------------------------------------------------
+
+    def _handle_bracket_open(self, open_b: str) -> bool:
+        close_b = self._BRACKET_PAIRS[open_b]
+        cursor = self.calc_expr_edit.textCursor()
+        if cursor.hasSelection():
+            sel = cursor.selectedText()
+            cursor.insertText(open_b + sel + close_b)
+        else:
+            cursor.insertText(open_b + close_b)
+            cursor.movePosition(QTextCursor.MoveOperation.Left, QTextCursor.MoveMode.MoveAnchor, 1)
+        self.calc_expr_edit.setTextCursor(cursor)
+        return True
+
+    def _handle_bracket_close(self, close_b: str) -> bool:
+        cursor = self.calc_expr_edit.textCursor()
+        pos = cursor.position()
+        text = self.calc_expr_edit.toPlainText()
+        if pos < len(text) and text[pos] == close_b:
+            cursor.setPosition(pos + 1)
+            self.calc_expr_edit.setTextCursor(cursor)
+            return True
+        return False
+
+    def _handle_bracket_backspace(self) -> bool:
+        cursor = self.calc_expr_edit.textCursor()
+        if cursor.hasSelection():
+            return False
+
+        pos = cursor.position()
+        if pos == 0:
+            return False
+
+        text = self.calc_expr_edit.toPlainText()
+        if pos >= len(text):
+            return False
+
+        before = text[pos - 1]
+        after = text[pos]
+        for open_b, close_b in self._BRACKET_PAIRS.items():
+            if before == open_b and after == close_b:
+                cursor.setPosition(pos - 1)
+                cursor.setPosition(pos + 1, QTextCursor.MoveMode.KeepAnchor)
+                cursor.removeSelectedText()
+                self.calc_expr_edit.setTextCursor(cursor)
+                return True
+
+        return False
+
+    def _navigate_popup(self, key, popup):
+        """Move the popup selection in response to arrow keys."""
+        model = popup.model()
+        if model is None or model.rowCount() == 0:
+            return
+        idx = popup.currentIndex()
+        row = idx.row() if idx.isValid() else 0
+        last = model.rowCount() - 1
+        if key == Qt.Key.Key_Up:
+            row = max(row - 1, 0)
+        elif key == Qt.Key.Key_Down:
+            row = min(row + 1, last)
+        elif key == Qt.Key.Key_PageUp:
+            row = max(row - 5, 0)
+        elif key == Qt.Key.Key_PageDown:
+            row = min(row + 5, last)
+        popup.setCurrentIndex(model.index(row, 0))
+
+    def _on_expr_text_changed(self):
+        if self._completing:
+            return
+        self._update_completer_popup()
+
+    def _on_cursor_position_changed(self):
+        """Reposition popup when cursor moves (e.g., arrow keys) without text change."""
+        if self._completing:
+            return
+        self._update_completer_popup()
+
+    def _update_completer_popup(self):
+        token = self._current_token()
+        self._completer.setCompletionPrefix(token)
+        if token:
+            self._completer.complete()
+            if self._completer.completionCount() > 0:
+                self._reposition_popup()
+                # Highlight the first item so the user sees what Enter will insert
+                popup = self._completer.popup()
+                if popup:
+                    popup.setCurrentIndex(popup.model().index(0, 0))
+            else:
+                popup = self._completer.popup()
+                if popup:
+                    popup.hide()
+        else:
+            popup = self._completer.popup()
+            if popup:
+                popup.hide()
+
+    def _current_token(self):
+        """Return the word at the cursor position."""
+        expr = self.calc_expr_edit.toPlainText()
+        cursor = self.calc_expr_edit.textCursor().position()
+        m = re.search(r'[\w.]*$', expr[:cursor])
+        return m.group() if m else ""
+
+    def _set_cursor_pos(self, pos):
+        """Set the text cursor to absolute position *pos*."""
+        cursor = self.calc_expr_edit.textCursor()
+        cursor.setPosition(pos)
+        self.calc_expr_edit.setTextCursor(cursor)
+
+    def _reposition_popup(self):
+        """Move the already-visible popup to sit just below the cursor."""
+        popup = self._completer.popup()
+        if popup is None:
+            return
+        cr = self.calc_expr_edit.cursorRect()
+        pos = self.calc_expr_edit.mapToGlobal(cr.bottomLeft())
+        popup.move(pos)
+        popup.setMinimumWidth(320)
+        popup.setMaximumHeight(260)
+
+    def _on_enter_pressed(self):
+        """Handle Enter key: if the popup is visible, complete the current
+        selection; otherwise trigger calculation, then clear the editor."""
+        popup = self._completer.popup()
+        if popup and popup.isVisible():
+            idx = popup.currentIndex()
+            if idx.isValid():
+                text = idx.data(Qt.ItemDataRole.DisplayRole)
+                if text:
+                    popup.hide()
+                    self._on_completion_activated(text)
+        else:
+            self._on_calculate()
+            self.calc_expr_edit.clear()
+
+    def _on_popup_activated(self, idx):
+        """Handle popup item activation (mouse click / keyboard) — extract
+        text from the model index and complete the current token."""
+        text = idx.data(Qt.ItemDataRole.DisplayRole)
+        if text:
+            self._completer.popup().hide()
+            self._on_completion_activated(text)
+
+    def _on_completion_activated(self, text):
+        """Replace only the current token using cursor operations."""
+        if not text:
+            return
+        self._completing = True
+        popup = self._completer.popup()
+        if popup:
+            popup.hide()
+
+        expr = self.calc_expr_edit.toPlainText()
+        cursor_pos = self.calc_expr_edit.textCursor().position()
+        prefix = expr[:cursor_pos]
+        m = re.search(r'[\w.]*$', prefix)
+        token_start = m.start() if m else cursor_pos
+
+        cursor = self.calc_expr_edit.textCursor()
+        cursor.setPosition(token_start)
+        cursor.setPosition(cursor_pos, QTextCursor.MoveMode.KeepAnchor)
+        cursor.insertText(text)
+        self.calc_expr_edit.setTextCursor(cursor)
+        self._completing = False
+
     # --- Calculator helpers ---
     def _insert_op(self, text):
-        cursor = self.calc_expr_edit.cursorPosition()
-        current = self.calc_expr_edit.text()
+        cursor = self.calc_expr_edit.textCursor().position()
+        current = self.calc_expr_edit.toPlainText()
         new_text = current[:cursor] + text + current[cursor:]
-        self.calc_expr_edit.setText(new_text)
+        self.calc_expr_edit.setPlainText(new_text)
         self.calc_expr_edit.setFocus()
-        self.calc_expr_edit.setCursorPosition(cursor + len(text))
+        self._set_cursor_pos(cursor + len(text))
 
     def _on_calculate(self):
-        expr = self.calc_expr_edit.text().strip()
+        expr = self.calc_expr_edit.toPlainText().strip()
         if not expr:
             QMessageBox.warning(self, "Empty Expression", "Enter an expression first.")
             return
@@ -200,7 +482,8 @@ class ToolPanelWidget(QWidget):
 
     # --- Summarize helpers ---
     def _on_summary_direction_changed(self, text):
-        self.summary_target.clear()
+        if self._summary_columns:
+            self.set_summary_targets(self._summary_columns, self._summary_row_count)
 
     def _on_summarize(self):
         direction = self.summary_direction.currentText().lower()
@@ -210,8 +493,32 @@ class ToolPanelWidget(QWidget):
             return
         self.summarize_requested.emit(direction, target)
 
+    def set_calc_completions(self, sheets: dict, active_sheet: str):
+        """Populate autocomplete with column names and SheetName.ColumnName patterns."""
+        from graphx.analysis.calculator import _sanitize
+        items = []
+        # Function names
+        items.extend([
+            "log(", "log10(", "log2(", "exp(", "sqrt(", "abs(", "pow(",
+            "sin(", "cos(", "tan(", "arcsin(", "arccos(", "arctan(",
+        ])
+        # Column names from all sheets (use raw names — the evaluator
+        # matches against raw column names, not sanitized ones)
+        for sheet_name, df in sheets.items():
+            s_sheet = _sanitize(sheet_name)
+            for col in df.columns:
+                col_str = str(col)
+                if sheet_name == active_sheet:
+                    items.append(col_str)
+                ref = f"{s_sheet}.{col_str}"
+                if " " not in ref:
+                    items.append(ref)
+        self._completer_model.setStringList(sorted(set(items)))
+
     def set_summary_targets(self, columns, row_count):
         """Populate the summary target combo with column names or row indices."""
+        self._summary_columns = columns
+        self._summary_row_count = row_count
         direction = self.summary_direction.currentText().lower()
         self.summary_target.clear()
         if direction == "column":

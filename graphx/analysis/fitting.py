@@ -130,6 +130,16 @@ def exp_fit_row(df, row_index):
     }
 
 
+# --- Extrapolation ---
+
+def extrapolate(fit_result, x_values):
+    """Predict y for given x values using a fitted function."""
+    fn = fit_result.get("fitted_fn")
+    if fn is None:
+        raise ValueError("No fitted function available for extrapolation")
+    return [{"x": x, "y": float(fn(x))} for x in x_values]
+
+
 # --- Summarization (for error bars) ---
 
 def summarize_column(df, col):
